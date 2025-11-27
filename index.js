@@ -617,9 +617,10 @@ function getRetryDelay(error, response, attempt) {
 }
 
 // Monkey-patch fetch
+// This must intercept ALL fetch requests, including those to /sysgen and other non-standard endpoints
 if (!(/** @type {any} */ (window))._fetchRetryPatched) {
     console.log('[Fetch Retry] Attempting to monkey-patch window.fetch...');
-    const originalFetch = window.fetch;
+    const originalFetch = window.fetch.bind(window);
     window.fetch = async function(...args) {
         if (!fetchRetrySettings.enabled) {
             if (fetchRetrySettings.debugMode) console.log('[Fetch Retry Debug] Fetch Retry is disabled. Bypassing.');
@@ -627,8 +628,11 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
         }
 
         const requestUrl = args[0] instanceof Request ? args[0].url : String(args[0]);
+        // Log all requests in debug mode, or log non-standard endpoints to ensure they're intercepted
         if (fetchRetrySettings.debugMode) {
             console.log('[Fetch Retry Debug] Intercepted a fetch request.', { url: requestUrl, attempt: 0 });
+        } else if (requestUrl.includes('/sysgen') || requestUrl.includes('/api/')) {
+            console.log(`[Fetch Retry] Intercepted request to: ${requestUrl}`);
         }
 
         const originalSignal = args[0] instanceof Request ? args[0].signal : (args[1]?.signal);
@@ -741,10 +745,13 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
                 }
                 
                 // Handle specific error codes
+                // CRITICAL: 429 errors must be retried for ALL requests, including /sysgen and other non-standard endpoints
                 if (result.status === 429) {
                     const url = args[0] instanceof Request ? args[0].url : String(args[0]);
-                    console.warn(`[Fetch Retry] Rate limited (429) for ${url}, attempt ${attempt + 1}/${fetchRetrySettings.maxRetries + 1}`);
+                    console.warn(`[Fetch Retry] Rate limited (429) detected for ${url}, attempt ${attempt + 1}/${fetchRetrySettings.maxRetries + 1}`);
+                    // Force retry for 429 regardless of endpoint type
                     if (attempt < fetchRetrySettings.maxRetries) {
+                        console.log(`[Fetch Retry] Will retry 429 error for ${url} (retry ${attempt + 1}/${fetchRetrySettings.maxRetries})`);
                         attempt = await handleRetry(new Error(`Rate limited (429): ${result.statusText}`), result, attempt);
                         continue;
                     } else {
