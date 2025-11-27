@@ -13,6 +13,7 @@ let fetchRetrySettings = {
     retryDelay: 5000, // ms
     rateLimitDelay: 5000, // ms for 429 errors
     thinkingTimeout: 60000, // ms, timeout for reasoning process
+    enableThinkingTimeout: true, // enable/disable thinking timeout
     showErrorNotification: true, // show error notification after all retries fail
     streamInactivityTimeout: 30000, // ms, timeout for stream inactivity
     minRetryDelay: 0, // Minimum delay for retries, useful for debugging or specific API quirks
@@ -66,6 +67,13 @@ const customSettings = [
         "max": 300000,
         "step": 10000,
         "description": t`Timeout in milliseconds for the AI reasoning process. If exceeded, the request is retried.`
+    },
+    {
+        "type": "checkbox",
+        "varId": "enableThinkingTimeout",
+        "displayText": t`Enable Thinking Timeout`,
+        "default": true,
+        "description": t`Enable or disable the thinking timeout. When disabled, requests will not be interrupted due to long thinking time.`
     },
     {
         "type": "checkbox",
@@ -361,11 +369,11 @@ function createSettingItem(container, setting, settings) {
             inputElement.checked = Boolean(settings[varId] ?? defaultValue); // Explicitly cast to boolean
             inputElement.addEventListener('change', () => {
                 settings[varId] = inputElement.checked;
+                fetchRetrySettings[varId] = inputElement.checked;
                 context.saveSettingsDebounced();
                 if (varId === 'enabled') {
                     toggleCss(inputElement.checked);
                 }
-                /** @type {any} */ (toastr).info(t`Please refresh the web page to apply changes.`, 'Settings Saved');
                 if (fetchRetrySettings.debugMode) console.log(`[Fetch Retry Debug] Checkbox setting changed: ${varId} = ${inputElement.checked}`);
             });
             settingRow.appendChild(inputElement);
@@ -379,7 +387,9 @@ function createSettingItem(container, setting, settings) {
             inputElement.step = String(setting.step);
             inputElement.value = String(settings[varId] ?? defaultValue);
             inputElement.addEventListener('input', () => {
-                settings[varId] = Number(inputElement.value);
+                const value = Number(inputElement.value);
+                settings[varId] = value;
+                fetchRetrySettings[varId] = value;
                 context.saveSettingsDebounced();
                 // Update associated number input if exists
                 const numberInput = /** @type {HTMLInputElement} */ (document.getElementById(`fetch-retry-${varId}-number`));
@@ -398,11 +408,12 @@ function createSettingItem(container, setting, settings) {
             numberInput.value = String(settings[varId] ?? defaultValue);
             numberInput.style.marginLeft = '10px';
             numberInput.addEventListener('change', () => {
-                settings[varId] = Number(numberInput.value);
+                const value = Number(numberInput.value);
+                settings[varId] = value;
+                fetchRetrySettings[varId] = value;
                 context.saveSettingsDebounced();
                 // Update associated slider if exists
                 inputElement.value = numberInput.value;
-                /** @type {any} */ (toastr).info(t`Please refresh the web page to apply changes.`, 'Settings Saved');
                 if (fetchRetrySettings.debugMode) console.log(`[Fetch Retry Debug] Number input setting changed: ${varId} = ${numberInput.value}`);
             });
 
@@ -453,8 +464,10 @@ function applyAllSettings() {
 
 // Show retry toast notification
 function showRetryToast(attempt, maxRetries, error) {
-    const currentAttempt = attempt + 1;
-    const message = `retry ${currentAttempt}/${maxRetries}`;
+    // attempt - это номер текущей попытки (начинается с 0)
+    // retryNumber - это номер ретрая (1, 2, 3...)
+    const retryNumber = attempt; // При attempt=1 это первый ретрай
+    const message = `retry ${retryNumber}/${maxRetries}`;
     
     // Build full message with error if available
     let fullMessage = message;
@@ -472,7 +485,7 @@ function showRetryToast(attempt, maxRetries, error) {
         
         console.log(`[Fetch Retry] Retry toast shown: ${message}`);
     } else {
-        console.log(`[Fetch Retry] Retry ${currentAttempt}/${maxRetries}`);
+        console.log(`[Fetch Retry] Retry ${retryNumber}/${maxRetries}`);
     }
 }
 
@@ -613,8 +626,9 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
             return originalFetch.apply(this, args);
         }
 
+        const requestUrl = args[0] instanceof Request ? args[0].url : String(args[0]);
         if (fetchRetrySettings.debugMode) {
-            console.log('[Fetch Retry Debug] Intercepted a fetch request.', { url: args[0] instanceof Request ? args[0].url : args[0], attempt: 0 });
+            console.log('[Fetch Retry Debug] Intercepted a fetch request.', { url: requestUrl, attempt: 0 });
         }
 
         const originalSignal = args[0] instanceof Request ? args[0].signal : (args[1]?.signal);
@@ -630,8 +644,9 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
         while (attempt <= fetchRetrySettings.maxRetries) {
             if (fetchRetrySettings.debugMode) console.log(`[Fetch Retry Debug] Starting fetch attempt ${attempt + 1}/${fetchRetrySettings.maxRetries + 1}`);
             if (originalSignal?.aborted) {
-                console.warn('[Fetch Retry] Request aborted by user during retry loop. Throwing last error.');
-                throw lastError ?? new DOMException('Request aborted by user', 'AbortError');
+                console.log('[Fetch Retry] Request aborted by user during retry loop. Returning abort error.');
+                const abortError = new DOMException('Request aborted by user', 'AbortError');
+                throw abortError;
             }
             const controller = new AbortController();
             const userAbortHandler = () => {
@@ -678,18 +693,25 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
                 if (fetchRetrySettings.debugMode) console.log('[Fetch Retry Debug] Executing original fetch...');
                 const fetchPromise = originalFetch.apply(this, [currentUrl, currentInit]);
 
-                const timeoutPromise = new Promise((_, reject) => {
-                    timeoutId = setTimeout(() => {
-                        const error = new Error('Thinking timeout reached');
-                        error.name = 'TimeoutError';
-                        controller.abort();
-                        reject(error);
-                        console.warn('[Fetch Retry] Fetch request timed out.');
-                    }, fetchRetrySettings.thinkingTimeout);
-                });
+                let timeoutPromise = null;
+                if (fetchRetrySettings.enableThinkingTimeout) {
+                    timeoutPromise = new Promise((_, reject) => {
+                        timeoutId = setTimeout(() => {
+                            const error = new Error('Thinking timeout reached');
+                            error.name = 'TimeoutError';
+                            controller.abort();
+                            reject(error);
+                            console.warn('[Fetch Retry] Fetch request timed out.');
+                        }, fetchRetrySettings.thinkingTimeout);
+                    });
+                }
 
-                const result = await Promise.race([fetchPromise, timeoutPromise]);
-                clearTimeout(timeoutId); // Clear timeout if fetch succeeds
+                const result = timeoutPromise 
+                    ? await Promise.race([fetchPromise, timeoutPromise])
+                    : await fetchPromise;
+                if (timeoutId) {
+                    clearTimeout(timeoutId); // Clear timeout if fetch succeeds
+                }
                 if (originalSignal) {
                     originalSignal.removeEventListener('abort', userAbortHandler);
                 }
@@ -720,28 +742,43 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
                 
                 // Handle specific error codes
                 if (result.status === 429) {
-                    console.warn(`[Fetch Retry] Rate limited (429), attempt ${attempt + 1}/${fetchRetrySettings.maxRetries + 1}`);
+                    const url = args[0] instanceof Request ? args[0].url : String(args[0]);
+                    console.warn(`[Fetch Retry] Rate limited (429) for ${url}, attempt ${attempt + 1}/${fetchRetrySettings.maxRetries + 1}`);
                     if (attempt < fetchRetrySettings.maxRetries) {
                         attempt = await handleRetry(new Error(`Rate limited (429): ${result.statusText}`), result, attempt);
                         continue;
+                    } else {
+                        // Max retries reached for 429, throw error
+                        console.error(`[Fetch Retry] Max retries reached for 429 error on ${url}.`);
+                        lastError = new Error(`Rate limited (429): ${result.statusText}`);
+                        lastResponse = result;
+                        break;
                     }
                 } else if (result.status >= 500) {
                     console.warn(`[Fetch Retry] Server error (${result.status}), attempt ${attempt + 1}/${fetchRetrySettings.maxRetries + 1}`);
                     if (attempt < fetchRetrySettings.maxRetries) {
                         attempt = await handleRetry(new Error(`Server error (${result.status}): ${result.statusText}`), result, attempt);
                         continue;
+                    } else {
+                        // Max retries reached for 5xx, throw error
+                        lastError = new Error(`Server error (${result.status}): ${result.statusText}`);
+                        lastResponse = result;
+                        break;
                     }
                 } else if (result.status >= 400) {
                     // Client errors other than 429 usually don't need retry
-                    console.error(`[Fetch Retry] Client error (${result.status}): ${result.statusText}. Not retrying.`);
-                    throw new Error(`HTTP ${result.status}: ${result.statusText}`);
+                    // Return the response instead of throwing to not interfere with generation
+                    console.log(`[Fetch Retry] Client error (${result.status}): ${result.statusText}. Returning response without retry.`);
+                    return result;
                 }
                 
                 console.error(`[Fetch Retry] Unexpected HTTP status: ${result.status}. Throwing error.`);
                 throw new Error(`HTTP ${result.status}: ${result.statusText}`);
                 
             } catch (err) {
-                clearTimeout(timeoutId); // Make sure timeout is cleared if there's another error
+                if (timeoutId) {
+                    clearTimeout(timeoutId); // Make sure timeout is cleared if there's another error
+                }
                 if (originalSignal) {
                     originalSignal.removeEventListener('abort', userAbortHandler);
                 }
@@ -758,8 +795,9 @@ if (!(/** @type {any} */ (window))._fetchRetryPatched) {
                     retryReason = `AI thinking timeout (${fetchRetrySettings.thinkingTimeout}ms)`;
                     shouldRetry = true;
                 } else if (err.name === 'AbortError') {
-                    if (originalSignal?.aborted || err.message === 'User aborted') {
-                        console.log('[Fetch Retry] Request aborted by user. Not retrying.');
+                    if (originalSignal?.aborted || err.message === 'User aborted' || err.message === 'Request aborted by user') {
+                        console.log('[Fetch Retry] Request aborted by user. Not retrying, propagating abort.');
+                        // При ручной остановке просто пробрасываем ошибку без ретраев
                         throw err;
                     }
                     retryReason = `Request aborted (${err.message})`;
